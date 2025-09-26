@@ -1,0 +1,16 @@
+# Secrets
+.env
+bot.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# Logs
+*.log
+logs/
