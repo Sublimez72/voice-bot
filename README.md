@@ -14,7 +14,9 @@ Runs on a Raspberry Pi (or any Linux host) as a systemd service.
   - `/voice_report [days]` → Show your voice time in the last X days (default 7) *(ephemeral)*  
   - `/voice_total` → Show your lifetime voice time *(ephemeral)*  
   - `/voice_current` → See who’s currently in voice channels  
-  - `/voice_top [days]` → Leaderboard of top 10 voice users in the last X days  
+  - `/voice_top [days]` → Leaderboard of top 10 voice users in the last X days
+  -  `/voice_heatmap [days] [public]` → Anonymized activity by hour of day (server-wide)
+  -  `/voice_weekday [days] [public]` → Anonymized activity by weekday (server-wide)
 
 ---
 
@@ -24,6 +26,7 @@ Runs on a Raspberry Pi (or any Linux host) as a systemd service.
 - Discord bot token
 - SQLite (built into Python)
 - Raspberry Pi or Linux server
+- matplotlib (for charts)
 
 ---
 🤝 Contributing
