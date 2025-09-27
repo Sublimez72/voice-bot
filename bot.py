@@ -1,8 +1,13 @@
 import os, time, aiosqlite
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
+import io
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 
 # -------- Env --------
 load_dotenv()
