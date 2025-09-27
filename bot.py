@@ -234,7 +234,8 @@ async def voice_weekdays(inter: discord.Interaction,
 
     # Avoid interaction timeout during plotting
     await inter.response.defer(thinking=True, ephemeral=not public)
-
+    
+    extra, params = afk_filter_clause()
     # Load all sessions overlapping the window (server-wide, anonymized)
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -289,7 +290,7 @@ async def voice_heatmap(
     public: bool = False
 ):
     since = now_ts() - days * 86400
-
+    extra, params = afk_filter_clause()
     # Load all sessions overlapping the window (server-wide, no per-user)
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -358,7 +359,7 @@ async def voice_daily(
 
     # Defer so we have time to compute & render the plot
     await inter.response.defer(thinking=True, ephemeral=not public)
-
+    extra, params = afk_filter_clause()
     # Load all sessions overlapping window (server-wide, anonymized)
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -447,18 +448,20 @@ async def voice_top(
     private: bool = False
 ):
     since = now_ts() - days * 86400
-
     # query DB here...
+    extra, params = afk_filter_clause()
     async with aiosqlite.connect(DB_PATH) as cx:
-        async with cx.execute("""
-            SELECT user_id, SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
+        async with cx.execute(f"""
+            SELECT user_id,
+                SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
             FROM voice_sessions
-            WHERE joined_ts >= ?
+            WHERE joined_ts >= ?{extra}
             GROUP BY user_id
             ORDER BY total DESC
             LIMIT 50
-        """, (since,)) as cur:
+        """, [since] + params) as cur:
             rows = await cur.fetchall()
+
 
     if not rows:
         await inter.response.send_message("No voice activity in that window.", ephemeral=True)
