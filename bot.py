@@ -16,7 +16,7 @@ TZ_NAME = os.getenv("TIMEZONE", "Europe/Stockholm")
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID", "0"))
 GUILD_ID = os.getenv("GUILD_ID")
 GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
-
+VOICE_TOP_PRIVATE_USER = int(os.getenv("VOICE_TOP_PRIVATE_USER", "0"))
 
 # -------- Intents (no message content needed) --------
 intents = discord.Intents.default()
@@ -436,36 +436,45 @@ async def voice_current(inter: discord.Interaction):
     msg = "\n".join(lines) if lines else "No one is in voice right now."
     await inter.response.send_message(msg)
 
-@tree.command(name="voice_top", description="Top 10 users by voice time in the last X days (default 7).", guild=GUILD_OBJ)
-async def voice_top(inter: discord.Interaction, days: app_commands.Range[int, 1, 3650] = 7):
-    # --- Restrict >7 days to administrators only ---
-    if days > 7 and not inter.user.guild_permissions.administrator:
-        await inter.response.send_message(
-            "You can only use more than 7 days for this command if you're an **administrator**.",
-            ephemeral=True
-        )
-        return
-    # ------------------------------------------------
-
+@tree.command(name="voice_top", description="Leaderboard of top 50 voice users in the last N days")
+@app_commands.describe(
+    days="How many days back (default 7)",
+    private="Only available to special user; defaults to false"
+)
+async def voice_top(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 7,
+    private: bool = False
+):
     since = now_ts() - days * 86400
-    extra, params = afk_filter_clause()
+
+    # query DB here...
     async with aiosqlite.connect(DB_PATH) as cx:
-        async with cx.execute(
-            f"SELECT user_id, SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total "
-            f"FROM voice_sessions WHERE joined_ts>=? {extra} "
-            f"GROUP BY user_id ORDER BY total DESC LIMIT 10",
-            [since] + params
-        ) as cur:
+        async with cx.execute("""
+            SELECT user_id, SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
+            FROM voice_sessions
+            WHERE joined_ts >= ?
+            GROUP BY user_id
+            ORDER BY total DESC
+            LIMIT 50
+        """, (since,)) as cur:
             rows = await cur.fetchall()
+
     if not rows:
-        await inter.response.send_message(f"No voice activity in the last {days}d.")
+        await inter.response.send_message("No voice activity in that window.", ephemeral=True)
         return
+
     lines = []
     for i, (uid, total) in enumerate(rows, start=1):
-        m = inter.guild.get_member(uid)
-        name = m.mention if m else f"<@{uid}>"
-        lines.append(f"{i}. {name} — **{fmt_duration(total)}**")
-    await inter.response.send_message(f"**Top voice time (last {days}d):**\n" + "\n".join(lines))
+        lines.append(f"{i}. <@{uid}> — {fmt_duration(total)}")
+
+    text = f"**Top 50 voice users (last {days}d):**\n" + "\n".join(lines)
+
+    # Default = public. Only allow VOICE_TOP_PRIVATE_USER to make it private.
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+
+    await inter.response.send_message(text, ephemeral=is_ephemeral)
+
 
 # -------- Run --------
 if __name__ == "__main__":
