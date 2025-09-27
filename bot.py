@@ -436,7 +436,7 @@ async def voice_current(inter: discord.Interaction):
     msg = "\n".join(lines) if lines else "No one is in voice right now."
     await inter.response.send_message(msg)
 
-@tree.command(name="voice_top", description="Leaderboard of top 50 voice users in the last N days")
+@tree.command(name="voice_top", description="Leaderboard of top 50 voice users in the last N days", guild=GUILD_OBJ)
 @app_commands.describe(
     days="How many days back (default 7)",
     private="Only available to special user; defaults to false"
