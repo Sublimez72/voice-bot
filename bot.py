@@ -14,7 +14,9 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 TZ_NAME = os.getenv("TIMEZONE", "Europe/Stockholm")
 AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID", "0"))
-GUILD_ID = os.getenv("GUILD_ID")  # optional: fast guild-only sync
+GUILD_ID = os.getenv("GUILD_ID")
+GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
+
 
 # -------- Intents (no message content needed) --------
 intents = discord.Intents.default()
@@ -46,6 +48,66 @@ def afk_filter_clause():
     if AFK_CHANNEL_ID: return " AND channel_id != ? ", [AFK_CHANNEL_ID]
     return " ", []
 
+def aggregate_seconds_by_hour(rows, since_ts: int, now_ts_: int, tz_name: str, afk_channel_id: int | None):
+    """rows: list of (joined_ts, left_ts, channel_id). Returns [sec_per_hour_0..23]."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    buckets = [0] * 24  # seconds per hour-of-day
+    for joined_ts, left_ts, ch_id in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+        # clamp to window
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_ts_, now_ts_)
+        if end <= start:
+            continue
+
+        cur = start
+        while cur < end:
+            cur_dt = datetime.fromtimestamp(cur, tz=tz)
+            # boundary = next top-of-hour
+            next_hour = (cur_dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+            boundary = min(int(next_hour.timestamp()), end)
+            span = boundary - cur
+            buckets[cur_dt.hour] += span
+            cur = boundary
+    return buckets
+
+def aggregate_seconds_by_weekday(rows, since_ts: int, now_ts_: int, tz_name: str, afk_channel_id: int | None):
+    """rows: list of (joined_ts, left_ts, channel_id). Returns [sec_per_day Mon..Sun]."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    # Python weekday(): Monday=0 .. Sunday=6
+    buckets = [0] * 7
+    for joined_ts, left_ts, ch_id in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_ts_, now_ts_)
+        if end <= start:
+            continue
+
+        cur = start
+        while cur < end:
+            cur_dt = datetime.fromtimestamp(cur, tz=tz)
+            # end of this calendar day
+            next_day = (cur_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+            boundary = min(int(next_day.timestamp()), end)
+            span = boundary - cur
+            buckets[cur_dt.weekday()] += span
+            cur = boundary
+    return buckets
+
+
 # -------- DB --------
 async def ensure_schema():
     async with aiosqlite.connect(DB_PATH) as cx:
@@ -65,21 +127,30 @@ async def ensure_schema():
 
 # -------- Startup --------
 @client.event
+async def setup_hook():
+    # Show what commands the tree has BEFORE syncing
+    print("DEBUG pre-sync commands:", [c.name for c in tree.get_commands(guild=GUILD_OBJ)])
+
+@client.event
 async def on_ready():
     await ensure_schema()
-
-    # Fast guild-only sync if GUILD_ID is set, otherwise global sync
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            await tree.sync(guild=guild)
+        if GUILD_OBJ:
+            # 1) Ensure guild commands (the ones you actually use)
+            await tree.sync(guild=GUILD_OBJ)
             print(f"✅ Synced slash commands to guild {GUILD_ID}")
+
+            # 2) One-time: delete any old GLOBAL commands (causing duplicates)
+            # Since your tree defines NO global commands, syncing globals now
+            # tells Discord to clear them.
+            cleared = await tree.sync()  # global sync with empty set
+            print("🧹 Cleared global commands (now none).")
         else:
+            # If you don't use GUILD_ID, you can’t do the cleanup this way.
             synced = await tree.sync()
             print(f"✅ Synced {len(synced)} global slash commands")
     except Exception as e:
         print(f"❌ Slash command sync failed: {e}")
-
     print(f"Bot online as {client.user}")
 
 # -------- Voice tracking --------
@@ -105,7 +176,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await cx.commit()
 
 # -------- Slash commands --------
-@tree.command(name="voice_report", description="Show YOUR voice time in the last X days (default 7).")
+@tree.command(name="voice_report", description="Show YOUR voice time in the last X days (default 7).", guild=GUILD_OBJ)
 async def voice_report(inter: discord.Interaction, days: app_commands.Range[int, 1, 3650] = 7):
     since = now_ts() - days * 86400
     extra, params = afk_filter_clause()
@@ -118,7 +189,117 @@ async def voice_report(inter: discord.Interaction, days: app_commands.Range[int,
             total = (await cur.fetchone())[0]
     await inter.response.send_message(f"🎧 {inter.user.mention}: last {days}d **{fmt_duration(total)}**", ephemeral=True)
 
-@tree.command(name="voice_total", description="Show YOUR lifetime total voice time.")
+@tree.command(name="voice_weekdays",
+              description="Anonymized total voice time by weekday (Mon–Sun), server-wide.",
+              guild=GUILD_OBJ)
+@app_commands.describe(
+    days="How many days back to include (default 30)",
+    public="Set to true to post publicly (default: private)"
+)
+async def voice_weekdays(inter: discord.Interaction,
+                         days: app_commands.Range[int, 1, 3650] = 30,
+                         public: bool = False):
+    since = now_ts() - days * 86400
+
+    # Avoid interaction timeout during plotting
+    await inter.response.defer(thinking=True, ephemeral=not public)
+
+    # Load all sessions overlapping the window (server-wide, anonymized)
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT joined_ts, left_ts, channel_id
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?
+            """,
+            (now_ts(), since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    buckets = aggregate_seconds_by_weekday(rows, since, now_ts(), TZ_NAME, AFK_CHANNEL_ID or None)
+    # Convert to hours and label Mon..Sun
+    labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    values_hours = [s / 3600.0 for s in buckets]
+
+    # Build plot
+    plt.figure(figsize=(8, 3))
+    plt.bar(range(7), values_hours)
+    plt.xticks(range(7), labels)
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"Voice activity by weekday (last {days}d){subtitle}")
+    plt.ylabel("Total hours")
+    plt.xlabel("Weekday")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    file = discord.File(buf, filename="voice_weekdays.png")
+    await inter.followup.send(
+        content=f"Anonymized server-wide weekday breakdown for last **{days}d**.",
+        file=file,
+        ephemeral=not public
+    )
+
+@tree.command(
+    name="voice_heatmap",
+    description="Anonymized activity by hour of day (server-wide).",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back to include (default 7)",
+    public="Set to true to post publicly (default: private)"
+)
+async def voice_heatmap(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 7,
+    public: bool = False
+):
+    since = now_ts() - days * 86400
+
+    # Load all sessions overlapping the window (server-wide, no per-user)
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT joined_ts, left_ts, channel_id
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?
+            """,
+            (now_ts(), since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    # Aggregate seconds per hour-of-day (AFK excluded if configured)
+    buckets = aggregate_seconds_by_hour(rows, since, now_ts(), TZ_NAME, AFK_CHANNEL_ID or None)
+    hours = list(range(24))
+    values_hours = [s / 3600.0 for s in buckets]
+
+    # Build plot
+    plt.figure(figsize=(9, 3))
+    plt.bar(hours, values_hours)
+    plt.xticks(hours, [f"{h:02d}" for h in hours])
+    subtitle = f"(AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"Voice activity by hour (last {days}d) {subtitle}")
+    plt.ylabel("Total hours")
+    plt.xlabel("Hour of day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    file = discord.File(buf, filename="voice_heatmap.png")
+
+    await inter.response.send_message(
+        content=f"Anonymized server-wide heatmap for last **{days}d**.",
+        file=file,
+        ephemeral=not public
+    )
+
+@tree.command(name="voice_total", description="Show YOUR lifetime total voice time.", guild=GUILD_OBJ)
 async def voice_total(inter: discord.Interaction):
     extra, params = afk_filter_clause()
     async with aiosqlite.connect(DB_PATH) as cx:
@@ -130,7 +311,7 @@ async def voice_total(inter: discord.Interaction):
             total = (await cur.fetchone())[0]
     await inter.response.send_message(f"📊 {inter.user.mention}: lifetime **{fmt_duration(total)}**", ephemeral=True)
 
-@tree.command(name="voice_current", description="List users currently in voice channels.")
+@tree.command(name="voice_current", description="List users currently in voice channels.", guild=GUILD_OBJ)
 async def voice_current(inter: discord.Interaction):
     lines = []
     for vc in inter.guild.voice_channels:
@@ -140,7 +321,7 @@ async def voice_current(inter: discord.Interaction):
     msg = "\n".join(lines) if lines else "No one is in voice right now."
     await inter.response.send_message(msg)
 
-@tree.command(name="voice_top", description="Top 10 users by voice time in the last X days (default 7).")
+@tree.command(name="voice_top", description="Top 10 users by voice time in the last X days (default 7).", guild=GUILD_OBJ)
 async def voice_top(inter: discord.Interaction, days: app_commands.Range[int, 1, 3650] = 7):
     # --- Restrict >7 days to administrators only ---
     if days > 7 and not inter.user.guild_permissions.administrator:
