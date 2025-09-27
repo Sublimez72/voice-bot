@@ -222,7 +222,7 @@ async def voice_weekdays(inter: discord.Interaction,
     values_hours = [s / 3600.0 for s in buckets]
 
     # Build plot
-    plt.figure(figsize=(8, 3))
+    plt.figure(figsize=(15, 5))
     plt.bar(range(7), values_hours)
     plt.xticks(range(7), labels)
     subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
@@ -277,7 +277,7 @@ async def voice_heatmap(
     values_hours = [s / 3600.0 for s in buckets]
 
     # Build plot
-    plt.figure(figsize=(9, 3))
+    plt.figure(figsize=(15, 5))
     plt.bar(hours, values_hours)
     plt.xticks(hours, [f"{h:02d}" for h in hours])
     subtitle = f"(AFK excluded)" if AFK_CHANNEL_ID else ""
