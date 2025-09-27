@@ -107,6 +107,37 @@ def aggregate_seconds_by_weekday(rows, since_ts: int, now_ts_: int, tz_name: str
             cur = boundary
     return buckets
 
+def aggregate_seconds_by_day(rows, since_ts: int, now_ts_: int, tz_name: str, afk_channel_id: int | None):
+    """
+    rows: list of (joined_ts, left_ts, channel_id)
+    returns: dict {date_str 'YYYY-MM-DD' -> seconds}
+    """
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    buckets = {}  # date_str -> seconds
+    for joined_ts, left_ts, ch_id in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_ts_, now_ts_)
+        if end <= start:
+            continue
+
+        cur = start
+        while cur < end:
+            cur_dt = datetime.fromtimestamp(cur, tz=tz)
+            next_midnight = (cur_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+            boundary = min(int(next_midnight.timestamp()), end)
+            span = boundary - cur
+            day_key = cur_dt.strftime("%Y-%m-%d")
+            buckets[day_key] = buckets.get(day_key, 0) + span
+            cur = boundary
+    return buckets
+
 
 # -------- DB --------
 async def ensure_schema():
@@ -298,6 +329,90 @@ async def voice_heatmap(
         file=file,
         ephemeral=not public
     )
+
+@tree.command(
+    name="voice_daily",
+    description="Anonymized total server voice hours per day (trend).",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back (default 7; >7 requires admin)",
+    public="Set true to post publicly (default: private)"
+)
+async def voice_daily(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 7,
+    public: bool = False
+):
+    # Privacy/permission rule: >7 days requires admin or manage_guild
+    if days > 7:
+        perms = inter.user.guild_permissions
+        if not (perms.administrator or perms.manage_guild):
+            await inter.response.send_message(
+                "⛔ Only admins can request more than 7 days.",
+                ephemeral=True
+            )
+            return
+
+    since = now_ts() - days * 86400
+
+    # Defer so we have time to compute & render the plot
+    await inter.response.defer(thinking=True, ephemeral=not public)
+
+    # Load all sessions overlapping window (server-wide, anonymized)
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT joined_ts, left_ts, channel_id
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?
+            """,
+            (now_ts(), since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    # Aggregate per day
+    buckets = aggregate_seconds_by_day(rows, since, now_ts(), TZ_NAME, AFK_CHANNEL_ID or None)
+
+    # Build ordered x-axis for the last N days (oldest -> newest)
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    days_list = []
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(days):
+        d = base + timedelta(days=i)
+        days_list.append(d.strftime("%Y-%m-%d"))
+
+    values_hours = [(buckets.get(day, 0) / 3600.0) for day in days_list]
+
+    # Plot
+    plt.figure(figsize=(15, 5))
+    x = list(range(len(days_list)))
+    plt.bar(x, values_hours)
+    # Show only a subset of x labels if many; rotate for readability
+    plt.xticks(x, days_list, rotation=45, ha="right")
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"Daily voice activity (last {days}d){subtitle}")
+    plt.ylabel("Hours")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    file = discord.File(buf, filename="voice_daily.png")
+    await inter.followup.send(
+        content=f"Anonymized server-wide daily totals for last **{days}d**.",
+        file=file,
+        ephemeral=not public
+    )
+
 
 @tree.command(name="voice_total", description="Show YOUR lifetime total voice time.", guild=GUILD_OBJ)
 async def voice_total(inter: discord.Interaction):
