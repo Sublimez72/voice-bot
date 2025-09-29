@@ -29,6 +29,10 @@ tree = app_commands.CommandTree(client)
 
 DB_PATH = "bot.db"
 
+# Same size for all plots
+PLOT_SIZE = (15, 5)
+
+
 # -------- Utils --------
 def now_ts() -> int: return int(time.time())
 
@@ -137,6 +141,135 @@ def aggregate_seconds_by_day(rows, since_ts: int, now_ts_: int, tz_name: str, af
             buckets[day_key] = buckets.get(day_key, 0) + span
             cur = boundary
     return buckets
+
+async def fetch_sessions_window(since_ts: int):
+    """Return rows (user_id, channel_id, joined_ts, left_ts) overlapping the window [since_ts, now]."""
+    now = now_ts()
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT user_id, channel_id, joined_ts, left_ts
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?
+            """,
+            (now, since_ts)
+        ) as cur:
+            rows = await cur.fetchall()
+    return rows
+
+def aggregate_unique_users_by_day(rows, since_ts: int, tz_name: str, afk_channel_id: int|None):
+    """rows: (user_id, channel_id, joined_ts, left_ts). Returns {YYYY-MM-DD: set(user_ids)}."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    day_users = {}  # date_str -> set of user ids
+    now_ = now_ts()
+    for user_id, ch_id, joined_ts, left_ts in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_, now_)
+        if end <= start:
+            continue
+
+        cur = start
+        while cur < end:
+            cur_dt = datetime.fromtimestamp(cur, tz=tz)
+            next_midnight = (cur_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+            boundary = min(int(next_midnight.timestamp()), end)
+            day_key = cur_dt.strftime("%Y-%m-%d")
+            s = day_users.get(day_key)
+            if s is None:
+                s = set()
+                day_users[day_key] = s
+            s.add(user_id)
+            cur = boundary
+    return day_users
+
+def peak_concurrency(rows, since_ts: int, tz_name: str, afk_channel_id: int|None):
+    """Return overall peak count and per-day peaks {YYYY-MM-DD: peak}."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    now_ = now_ts()
+    events = []  # (timestamp, delta)
+    for _uid, ch_id, joined_ts, left_ts in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_, now_)
+        if end <= start:
+            continue
+        events.append((start, +1))
+        events.append((end, -1))
+    events.sort()
+
+    overall_peak = 0
+    cur = 0
+    per_day_peak = {}  # date_str -> peak
+    last_ts = None
+
+    for ts, delta in events:
+        # update day peak at this boundary (assign current 'cur' to the day of ts)
+        cur += delta
+        if cur > overall_peak:
+            overall_peak = cur
+        day_key = datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d")
+        prev = per_day_peak.get(day_key, 0)
+        if cur > prev:
+            per_day_peak[day_key] = cur
+        last_ts = ts
+    return overall_peak, per_day_peak
+
+def solo_seconds_per_user(rows, since_ts: int, tz_name: str, afk_channel_id: int | None):
+    """
+    rows: list of (user_id, channel_id, joined_ts, left_ts) overlapping the window.
+    Returns dict {user_id: solo_seconds} where 'solo' means channel occupancy == 1.
+    """
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    now_ = now_ts()
+    # Build per-channel event streams: (timestamp, user_id, delta)
+    per_ch: dict[int, list[tuple[int, int, int]]] = {}
+    for uid, ch_id, joined_ts, left_ts in rows:
+        if afk_channel_id and ch_id == afk_channel_id:
+            continue
+        start = max(joined_ts, since_ts)
+        end = min(left_ts or now_, now_)
+        if end <= start:
+            continue
+        per_ch.setdefault(ch_id, []).append((start, uid, +1))
+        per_ch[ch_id].append((end, uid, -1))
+
+    solo_totals: dict[int, int] = {}
+    for ch_id, events in per_ch.items():
+        # Sort by time; process leaves (-1) before joins (+1) at the same timestamp
+        events.sort(key=lambda x: (x[0], x[2]))
+        present: set[int] = set()
+        prev_t: int | None = None
+
+        for t, uid, delta in events:
+            if prev_t is not None and len(present) == 1:
+                # Attribute the interval to the only user present
+                only_uid = next(iter(present))
+                solo_totals[only_uid] = solo_totals.get(only_uid, 0) + (t - prev_t)
+            # Apply event
+            if delta == +1:
+                present.add(uid)
+            else:
+                present.discard(uid)
+            prev_t = t
+    return solo_totals
 
 
 # -------- DB --------
@@ -254,7 +387,7 @@ async def voice_weekdays(inter: discord.Interaction,
     values_hours = [s / 3600.0 for s in buckets]
 
     # Build plot
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=PLOT_SIZE)
     plt.bar(range(7), values_hours)
     plt.xticks(range(7), labels)
     subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
@@ -274,6 +407,150 @@ async def voice_weekdays(inter: discord.Interaction,
         file=file,
         ephemeral=not public
     )
+
+@tree.command(
+    name="voice_solo",
+    description="Top 50 users by time spent alone in voice (occupancy == 1).",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back (default 7; >7 requires admin)",
+    private="Only available to special user; defaults to false"
+)
+async def voice_solo(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 7,
+    private: bool = False
+):
+    if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
+        return
+
+    # ✅ Decide once: should this interaction be ephemeral?
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+
+    since = now_ts() - days * 86400
+    # ✅ Use the same flag here
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    # Fetch sessions overlapping the window (server-wide)
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT user_id, channel_id, joined_ts, left_ts
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?
+            """,
+            (now_ts(), since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    # Compute per-user solo seconds (AFK excluded if configured)
+    solo_totals = solo_seconds_per_user(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
+
+    if not solo_totals:
+        # ✅ And the same flag here
+        await inter.followup.send("No solo voice time recorded in that window.", ephemeral=is_ephemeral)
+        return
+
+    top = sorted(solo_totals.items(), key=lambda kv: kv[1], reverse=True)[:50]
+    lines = [f"{i}. <@{uid}> — {fmt_duration(seconds)}" for i, (uid, seconds) in enumerate(top, start=1)]
+    text = f"**Top 50 solo voice time (last {days}d)**{' (AFK excluded)' if AFK_CHANNEL_ID else ''}:\n" + "\n".join(lines)
+
+    # ✅ Final send uses the same flag
+    await inter.followup.send(text, ephemeral=is_ephemeral)
+
+
+@tree.command(name="voice_peak",
+              description="Anonymized peak concurrent users (overall + per-day chart).",
+              guild=GUILD_OBJ)
+@app_commands.describe(days="How many days back (default 7; >7 requires admin)",
+                       public="Post publicly (default: private)")
+async def voice_peak(inter: discord.Interaction,
+                     days: app_commands.Range[int, 1, 3650] = 7,
+                     public: bool = True):
+    if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
+        return
+
+    since = now_ts() - days * 86400
+    await inter.response.defer(thinking=True, ephemeral=not public)
+
+    rows = await fetch_sessions_window(since)
+    overall_peak, per_day_peak = peak_concurrency(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
+
+    # ordered days
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    labels = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    values = [per_day_peak.get(d, 0) for d in labels]
+
+    plt.figure(figsize=PLOT_SIZE)
+    x = range(len(labels))
+    plt.bar(x, values)
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.title(f"Peak concurrent users per day (last {days}d){' (AFK excluded)' if AFK_CHANNEL_ID else ''}")
+    plt.ylabel("Peak users")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150); plt.close(); buf.seek(0)
+
+    await inter.followup.send(
+        content=f"**Overall peak** in last {days}d: **{overall_peak}** users.",
+        file=discord.File(buf, "voice_peak.png"),
+        ephemeral=not public
+    )
+
+
+@tree.command(name="voice_daily_unique",
+              description="Anonymized unique participants per day (last N days).",
+              guild=GUILD_OBJ)
+@app_commands.describe(days="How many days back (default 7; >7 requires admin)",
+                       public="Post publicly (default: private)")
+async def voice_daily_unique(inter: discord.Interaction,
+                             days: app_commands.Range[int, 1, 3650] = 7,
+                             public: bool = True):
+    if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
+        return
+
+    since = now_ts() - days * 86400
+    await inter.response.defer(thinking=True, ephemeral=not public)
+
+    rows = await fetch_sessions_window(since)
+    day_users = aggregate_unique_users_by_day(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
+
+    # Build ordered days list
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    labels = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    values = [len(day_users.get(d, set())) for d in labels]
+
+    plt.figure(figsize=PLOT_SIZE)
+    x = range(len(labels))
+    plt.bar(x, values)
+    plt.xticks(x, labels, rotation=45, ha="right")
+    plt.title(f"Unique voice participants per day (last {days}d){' (AFK excluded)' if AFK_CHANNEL_ID else ''}")
+    plt.ylabel("Unique users")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150); plt.close(); buf.seek(0)
+    await inter.followup.send(file=discord.File(buf, "voice_daily_unique.png"),
+                              content=f"Unique participants per day (last **{days}d**).",
+                              ephemeral=not public)
+
 
 @tree.command(
     name="voice_heatmap",
@@ -309,7 +586,7 @@ async def voice_heatmap(
     values_hours = [s / 3600.0 for s in buckets]
 
     # Build plot
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=PLOT_SIZE)
     plt.bar(hours, values_hours)
     plt.xticks(hours, [f"{h:02d}" for h in hours])
     subtitle = f"(AFK excluded)" if AFK_CHANNEL_ID else ""
@@ -391,7 +668,7 @@ async def voice_daily(
     values_hours = [(buckets.get(day, 0) / 3600.0) for day in days_list]
 
     # Plot
-    plt.figure(figsize=(15, 5))
+    plt.figure(figsize=PLOT_SIZE)
     x = list(range(len(days_list)))
     plt.bar(x, values_hours)
     # Show only a subset of x labels if many; rotate for readability
