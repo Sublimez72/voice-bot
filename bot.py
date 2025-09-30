@@ -7,6 +7,7 @@ import io
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import shutil
 
 
 # -------- Env --------
@@ -340,6 +341,46 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             await cx.commit()
 
 # -------- Slash commands --------
+@tree.command(
+    name="pi_storage",
+    description="Show disk usage on your Pi, ephemerally and restricted.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    path="Filesystem path to check (default '/')"
+)
+async def pi_storage(inter: discord.Interaction, path: str = "/"):
+    # Restrict to the special user only
+    if inter.user.id != VOICE_TOP_PRIVATE_USER:
+        await inter.response.send_message("⛔ This command is restricted.", ephemeral=True)
+        return
+
+    # Always reply ephemerally for privacy
+    try:
+        usage = shutil.disk_usage(path)
+        total, used, free = usage.total, usage.used, usage.free
+        pct_used = (used / total * 100) if total else 0.0
+
+        def fmt_bytes(n: int) -> str:
+            for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+                if n < 1024:
+                    return f"{n:.2f} {unit}"
+                n /= 1024
+            return f"{n:.2f} EB"
+
+        msg = (
+            f"💾 **Disk usage for** `{path}`\n"
+            f"• Total: **{fmt_bytes(total)}**\n"
+            f"• Used: **{fmt_bytes(used)}** ({pct_used:.1f}%)\n"
+            f"• Free: **{fmt_bytes(free)}**"
+        )
+        await inter.response.send_message(msg, ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(
+            f"❌ Couldn't read disk usage for `{path}`: `{e}`",
+            ephemeral=True
+        )
+
 @tree.command(name="voice_report", description="Show YOUR voice time in the last X days (default 7).", guild=GUILD_OBJ)
 async def voice_report(inter: discord.Interaction, days: app_commands.Range[int, 1, 3650] = 7):
     since = now_ts() - days * 86400
