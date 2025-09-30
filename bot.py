@@ -18,6 +18,9 @@ AFK_CHANNEL_ID = int(os.getenv("AFK_CHANNEL_ID", "0"))
 GUILD_ID = os.getenv("GUILD_ID")
 GUILD_OBJ = discord.Object(id=int(GUILD_ID)) if GUILD_ID else None
 VOICE_TOP_PRIVATE_USER = int(os.getenv("VOICE_TOP_PRIVATE_USER", "0"))
+VOICE_COMMAND_CHANNEL = int(os.getenv("VOICE_COMMAND_CHANNEL", "0"))
+BOT_CHANNEL = int(os.getenv("VOICE_BOT_CHANNEL", "0"))
+ALLOWED_CHANNELS = {cid for cid in (VOICE_COMMAND_CHANNEL, BOT_CHANNEL) if cid}
 
 # -------- Intents (no message content needed) --------
 intents = discord.Intents.default()
@@ -26,8 +29,31 @@ intents.voice_states = True
 
 # Use plain Client + CommandTree (no prefix commands at all)
 client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+# Restrict all slash commands to specific channels
+class RestrictedTree(app_commands.CommandTree):
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        ch = inter.channel
+        cid = getattr(inter, "channel_id", None) or (ch.id if ch else None)
+        parent_id = getattr(ch, "parent_id", None) if isinstance(ch, discord.Thread) else None
 
+        if cid in ALLOWED_CHANNELS or parent_id in ALLOWED_CHANNELS:
+            return True
+
+        # Send a friendly ephemeral denial message
+        where = " or ".join(f"<#{cid}>" for cid in ALLOWED_CHANNELS) or "the designated channels"
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(
+                    f"⛔ This command can only be used in {where}.", ephemeral=True
+                )
+            else:
+                await inter.response.send_message(
+                    f"⛔ This command can only be used in {where}.", ephemeral=True
+                )
+        except Exception:
+            pass
+        return False
+tree = RestrictedTree(client)
 DB_PATH = "bot.db"
 
 # Same size for all plots
