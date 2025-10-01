@@ -8,6 +8,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import shutil
+from discord.errors import NotFound, Forbidden
+from discord.utils import escape_markdown
 
 
 # -------- Env --------
@@ -425,11 +427,11 @@ async def voice_report(inter: discord.Interaction, days: app_commands.Range[int,
               guild=GUILD_OBJ)
 @app_commands.describe(
     days="How many days back to include (default 30)",
-    public="Set to true to post publicly (default: private)"
+    public="Set to false to post privately (default: true)"
 )
 async def voice_weekdays(inter: discord.Interaction,
                          days: app_commands.Range[int, 1, 3650] = 30,
-                         public: bool = False):
+                         public: bool = True):
     since = now_ts() - days * 86400
 
     # Avoid interaction timeout during plotting
@@ -489,16 +491,16 @@ async def voice_solo(
     days: app_commands.Range[int, 1, 3650] = 7,
     private: bool = False
 ):
+    # Guard for long ranges
     if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
         await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
         return
 
-    # ✅ Decide once: should this interaction be ephemeral?
+    # Decide ephemerality once, then DEFER right away
     is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     since = now_ts() - days * 86400
-    # ✅ Use the same flag here
-    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     # Fetch sessions overlapping the window (server-wide)
     async with aiosqlite.connect(DB_PATH) as cx:
@@ -516,23 +518,52 @@ async def voice_solo(
     solo_totals = solo_seconds_per_user(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
 
     if not solo_totals:
-        # ✅ And the same flag here
         await inter.followup.send("No solo voice time recorded in that window.", ephemeral=is_ephemeral)
         return
 
-    top = sorted(solo_totals.items(), key=lambda kv: kv[1], reverse=True)[:50]
-    lines = [f"{i}. <@{uid}> — {fmt_duration(seconds)}" for i, (uid, seconds) in enumerate(top, start=1)]
-    text = f"**Top 50 solo voice time (last {days}d)**{' (AFK excluded)' if AFK_CHANNEL_ID else ''}:\n" + "\n".join(lines)
+    # Resolve server nicknames with a tiny cache; fetch member if not cached
+    member_cache: dict[int, str] = {}
 
-    # ✅ Final send uses the same flag
-    await inter.followup.send(text, ephemeral=is_ephemeral)
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        name = escape_markdown((m.nick or m.name) or str(uid))  # server nickname > username
+        member_cache[uid] = name
+        return name
+
+    # Top 50
+    top = sorted(solo_totals.items(), key=lambda kv: kv[1], reverse=True)[:50]
+
+    lines = []
+    for i, (uid, seconds) in enumerate(top, start=1):
+        name = await label_for(uid)
+        lines.append(f"{i}. {name} — {fmt_duration(seconds)}")
+
+    text = (
+        f"**Top 50 solo voice time (last {days}d)**"
+        f"{' (AFK excluded)' if AFK_CHANNEL_ID else ''}:\n" + "\n".join(lines)
+    )
+
+    await inter.followup.send(
+        text,
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
 
 
 @tree.command(name="voice_peak",
               description="Anonymized peak concurrent users (overall + per-day chart).",
               guild=GUILD_OBJ)
 @app_commands.describe(days="How many days back (default 7; >7 requires admin)",
-                       public="Post publicly (default: private)")
+                       public="Set to false to post privately (default: true)")
 async def voice_peak(inter: discord.Interaction,
                      days: app_commands.Range[int, 1, 3650] = 7,
                      public: bool = True):
@@ -579,7 +610,7 @@ async def voice_peak(inter: discord.Interaction,
               description="Anonymized unique participants per day (last N days).",
               guild=GUILD_OBJ)
 @app_commands.describe(days="How many days back (default 7; >7 requires admin)",
-                       public="Post publicly (default: private)")
+                       public="Set to false to post privately (default: true)")
 async def voice_daily_unique(inter: discord.Interaction,
                              days: app_commands.Range[int, 1, 3650] = 7,
                              public: bool = True):
@@ -626,12 +657,12 @@ async def voice_daily_unique(inter: discord.Interaction,
 )
 @app_commands.describe(
     days="How many days back to include (default 7)",
-    public="Set to true to post publicly (default: private)"
+    public="Set to false to post privately (default: true)"
 )
 async def voice_heatmap(
     inter: discord.Interaction,
     days: app_commands.Range[int, 1, 3650] = 7,
-    public: bool = False
+    public: bool = True  # <-- Default is now public
 ):
     since = now_ts() - days * 86400
     extra, params = afk_filter_clause()
@@ -682,12 +713,12 @@ async def voice_heatmap(
 )
 @app_commands.describe(
     days="How many days back (default 7; >7 requires admin)",
-    public="Set true to post publicly (default: private)"
+    public="Set false to post privately (default: true)"
 )
 async def voice_daily(
     inter: discord.Interaction,
     days: app_commands.Range[int, 1, 3650] = 7,
-    public: bool = False
+    public: bool = True
 ):
     # Privacy/permission rule: >7 days requires admin or manage_guild
     if days > 7:
@@ -791,13 +822,16 @@ async def voice_top(
     days: app_commands.Range[int, 1, 3650] = 7,
     private: bool = False
 ):
+    # Decide ephemerality once, then DEFER right away to avoid 10062
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
     since = now_ts() - days * 86400
-    # query DB here...
     extra, params = afk_filter_clause()
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(f"""
             SELECT user_id,
-                SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
+                   SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
             FROM voice_sessions
             WHERE joined_ts >= ?{extra}
             GROUP BY user_id
@@ -806,21 +840,41 @@ async def voice_top(
         """, [since] + params) as cur:
             rows = await cur.fetchall()
 
-
     if not rows:
-        await inter.response.send_message("No voice activity in that window.", ephemeral=True)
+        await inter.followup.send("No voice activity in that window.", ephemeral=is_ephemeral)
         return
+
+    # Resolve server nicknames; fetch on cache miss
+    member_cache: dict[int, str] = {}
+
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        name = escape_markdown((m.nick or m.name) or str(uid))
+        member_cache[uid] = name
+        return name
 
     lines = []
     for i, (uid, total) in enumerate(rows, start=1):
-        lines.append(f"{i}. <@{uid}> — {fmt_duration(total)}")
+        name = await label_for(uid)
+        lines.append(f"{i}. {name} — {fmt_duration(total)}")
 
     text = f"**Top 50 voice users (last {days}d):**\n" + "\n".join(lines)
 
-    # Default = public. Only allow VOICE_TOP_PRIVATE_USER to make it private.
-    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.followup.send(
+        text,
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
 
-    await inter.response.send_message(text, ephemeral=is_ephemeral)
+
 
 
 # -------- Run --------
