@@ -1,6 +1,8 @@
 # Secrets
 .env
 bot.db
+bot.db.old
+bot.db.notasold
 
 # Python
 __pycache__/
