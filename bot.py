@@ -2407,6 +2407,532 @@ async def voice_session_count(
 
 
 @tree.command(
+    name="voice_server_overview",
+    description="Quick snapshot of the server's all-time voice activity.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_server_overview(inter: discord.Interaction, private: bool = False):
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    now = now_ts()
+    afk_cond = " AND channel_id != ?" if AFK_CHANNEL_ID else ""
+    afk_params = [AFK_CHANNEL_ID] if AFK_CHANNEL_ID else []
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT COUNT(*), COUNT(DISTINCT user_id), "
+            f"SUM(COALESCE(left_ts, ?) - joined_ts), "
+            f"AVG(COALESCE(left_ts, ?) - joined_ts) "
+            f"FROM voice_sessions WHERE 1=1{afk_cond}",
+            [now, now] + afk_params
+        ) as cur:
+            total_sessions, total_users, total_secs, avg_session_secs = await cur.fetchone()
+
+        async with cx.execute(
+            f"SELECT channel_id, SUM(COALESCE(left_ts, ?) - joined_ts) AS t "
+            f"FROM voice_sessions WHERE 1=1{afk_cond} GROUP BY channel_id ORDER BY t DESC LIMIT 1",
+            [now] + afk_params
+        ) as cur:
+            top_ch_row = await cur.fetchone()
+
+    total_secs = total_secs or 0
+    avg_session_secs = avg_session_secs or 0
+    total_sessions = total_sessions or 0
+    total_users = total_users or 0
+
+    currently_active = sum(
+        1 for vc in inter.guild.voice_channels
+        for m in vc.members
+        if not (AFK_CHANNEL_ID and vc.id == AFK_CHANNEL_ID)
+    )
+
+    top_ch_name = "N/A"
+    if top_ch_row:
+        ch = inter.guild.get_channel(top_ch_row[0])
+        top_ch_name = ch.name if ch else f"Channel {top_ch_row[0]}"
+
+    embed = discord.Embed(
+        title=f"🌐  {inter.guild.name} — Voice Overview",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="⏱️ All-time hours",      value=fmt_duration(total_secs),         inline=True)
+    embed.add_field(name="🔢 Total sessions",       value=f"{total_sessions:,}",             inline=True)
+    embed.add_field(name="👥 Unique users",         value=str(total_users),                  inline=True)
+    embed.add_field(name="⏲️ Avg session length",   value=fmt_duration(int(avg_session_secs)), inline=True)
+    embed.add_field(name="🔊 Most popular channel", value=top_ch_name,                       inline=True)
+    embed.add_field(name="🟢 In voice now",         value=str(currently_active),             inline=True)
+    if AFK_CHANNEL_ID:
+        embed.set_footer(text="AFK channel excluded from all figures.")
+    await inter.followup.send(embed=embed, ephemeral=is_ephemeral)
+
+
+@tree.command(
+    name="voice_next_milestone",
+    description="How close are you to your next voice time milestone — and when will you hit it?",
+    guild=GUILD_OBJ
+)
+async def voice_next_milestone(inter: discord.Interaction):
+    await inter.response.defer(thinking=True, ephemeral=True)
+
+    now = now_ts()
+    uid = inter.user.id
+    extra, params = afk_filter_clause()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT SUM(COALESCE(left_ts, ?) - joined_ts) FROM voice_sessions WHERE user_id=?{extra}",
+            [now, uid] + params
+        ) as cur:
+            total_secs = (await cur.fetchone())[0] or 0
+
+        since_7 = now - 7 * 86400
+        async with cx.execute(
+            f"SELECT SUM(COALESCE(left_ts, ?) - joined_ts) FROM voice_sessions "
+            f"WHERE user_id=? AND joined_ts >= ?{extra}",
+            [now, uid, since_7] + params
+        ) as cur:
+            last7_secs = (await cur.fetchone())[0] or 0
+
+    total_hours = total_secs / 3600.0
+    pace_h_per_day = (last7_secs / 3600.0) / 7
+
+    next_thresh = next((h for h in MILESTONE_HOURS if h > total_hours), None)
+
+    embed = discord.Embed(
+        title=f"🎯  Next milestone — {escape_markdown(inter.user.display_name)}",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="⏱️ Current total", value=fmt_duration(total_secs), inline=True)
+
+    if next_thresh is None:
+        embed.add_field(name="🏆 Status", value="You've hit every milestone! Legendary.", inline=False)
+    else:
+        remaining_h = next_thresh - total_hours
+        remaining_secs = int(remaining_h * 3600)
+        embed.add_field(name="🎯 Next milestone", value=f"**{next_thresh}h**", inline=True)
+        embed.add_field(name="⏳ Remaining",      value=fmt_duration(remaining_secs), inline=True)
+        embed.add_field(name="📅 7-day pace",      value=f"{pace_h_per_day:.2f}h/day", inline=True)
+
+        if pace_h_per_day > 0:
+            days_to_go = remaining_h / pace_h_per_day
+            eta_ts = now + int(days_to_go * 86400)
+            eta_str = ts_to_local(eta_ts)
+            if days_to_go < 1:
+                eta_label = f"< 1 day ({eta_str})"
+            elif days_to_go < 2:
+                eta_label = f"~1 day ({eta_str})"
+            else:
+                eta_label = f"~{int(days_to_go)} days ({eta_str})"
+            embed.add_field(name="🚀 ETA at current pace", value=eta_label, inline=False)
+        else:
+            embed.add_field(name="🚀 ETA", value="No activity last 7 days — get back in voice!", inline=False)
+
+    await inter.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(
+    name="voice_leaderboard_chart",
+    description="Top 15 users by voice time as a visual bar chart.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back (default 30; >30 requires admin)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_leaderboard_chart(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 30,
+    private: bool = False
+):
+    if days > 30 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 30 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+    now = now_ts()
+    extra, params = afk_filter_clause()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"""
+            SELECT user_id,
+                   SUM(MIN(COALESCE(left_ts, ?), ?) - MAX(joined_ts, ?)) AS total
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, ?) > ?
+            {extra}
+            GROUP BY user_id
+            ORDER BY total DESC
+            LIMIT 15
+            """,
+            [now, now, since, now, now, since] + params
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await inter.followup.send("No voice activity in that window.", ephemeral=is_ephemeral)
+        return
+
+    names = []
+    hours = []
+    for uid, total_secs in rows:
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                pass
+        name = escape_markdown(m.display_name if m else f"User {uid}")
+        names.append(name)
+        hours.append(total_secs / 3600.0)
+
+    max_h = max(hours) if hours else 1
+    colors = [plt.cm.RdYlGn(h / max_h) for h in hours]
+
+    fig, ax = plt.subplots(figsize=(8, max(4, len(names) * 0.55)))
+    y_pos = range(len(names))
+    bars = ax.barh(list(y_pos), hours, color=colors)
+    ax.set_yticks(list(y_pos))
+    ax.set_yticklabels(names)
+    ax.invert_yaxis()
+    ax.set_xlabel("Hours")
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    ax.set_title(f"Top voice users (last {days}d){subtitle}")
+    for bar, h in zip(bars, hours):
+        ax.text(bar.get_width() + max_h * 0.01, bar.get_y() + bar.get_height() / 2,
+                fmt_duration(int(h * 3600)), va="center", fontsize=8)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    await inter.followup.send(
+        content=f"📊 **Top {len(names)} voice users (last {days}d)**",
+        file=discord.File(buf, "voice_leaderboard.png"),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
+    name="voice_best_day",
+    description="Your top 5 personal best days by voice time — always private.",
+    guild=GUILD_OBJ
+)
+async def voice_best_day(inter: discord.Interaction):
+    await inter.response.defer(thinking=True, ephemeral=True)
+
+    uid = inter.user.id
+    now = now_ts()
+    extra, params = afk_filter_clause()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT joined_ts, COALESCE(left_ts, ?), channel_id "
+            f"FROM voice_sessions WHERE user_id=?{extra}",
+            [now, uid] + params
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await inter.followup.send("No voice sessions recorded yet.", ephemeral=True)
+        return
+
+    day_buckets = aggregate_seconds_by_day(rows, 0, now, TZ_NAME, AFK_CHANNEL_ID or None)
+
+    if not day_buckets:
+        await inter.followup.send("Not enough data to compute best days.", ephemeral=True)
+        return
+
+    top_days = sorted(day_buckets.items(), key=lambda x: x[1], reverse=True)[:5]
+    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+    lines = [
+        f"{medals[i]} **{day}** — {fmt_duration(secs)}"
+        for i, (day, secs) in enumerate(top_days)
+    ]
+
+    embed = discord.Embed(
+        title=f"🏅  {escape_markdown(inter.user.display_name)} — Best days ever",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Top 5 days by voice time", value="\n".join(lines), inline=False)
+    best_day_date, best_day_secs = top_days[0]
+    embed.set_footer(text=f"Personal record: {fmt_duration(best_day_secs)} on {best_day_date}")
+    await inter.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(
+    name="voice_early_bird",
+    description="Leaderboard of who racks up the most voice time during early-morning hours.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back to include (default 7; >7 requires admin)",
+    start_hour="Start of the morning window in 24h local time (default 5)",
+    end_hour="End of the morning window in 24h local time (default 9)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_early_bird(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 7,
+    start_hour: app_commands.Range[int, 0, 23] = 5,
+    end_hour: app_commands.Range[int, 0, 23] = 9,
+    private: bool = False
+):
+    if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+    now = now_ts()
+
+    rows = await fetch_sessions_window(since)
+    morning_secs = aggregate_night_seconds_per_user(
+        rows, since, now, TZ_NAME, AFK_CHANNEL_ID or None, start_hour, end_hour
+    )
+
+    if not morning_secs:
+        await inter.followup.send("No early-morning voice activity in that window.", ephemeral=is_ephemeral)
+        return
+
+    top = sorted(morning_secs.items(), key=lambda x: x[1], reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    member_cache: dict[int, str] = {}
+
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        name = escape_markdown(m.display_name)
+        member_cache[uid] = name
+        return name
+
+    window_label = f"{start_hour:02d}:00–{end_hour:02d}:00"
+    lines = []
+    for i, (uid, secs) in enumerate(top):
+        name = await label_for(uid)
+        lines.append(f"{medals[i]} **{name}** — {fmt_duration(secs)}")
+
+    await inter.followup.send(
+        f"🌅 **Early bird leaderboard ({window_label}, last {days}d):**\n" + "\n".join(lines),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
+    name="voice_consistency",
+    description="Leaderboard ranked by % of days active in voice — rewards regulars over grinders.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="Window to measure (default 30; >30 requires admin)",
+    min_days="Minimum active days required to appear (default 2)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_consistency(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 2, 3650] = 30,
+    min_days: app_commands.Range[int, 1, 30] = 2,
+    private: bool = False
+):
+    if days > 30 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 30 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+    now = now_ts()
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    afk_cond = " AND channel_id != ?" if AFK_CHANNEL_ID else ""
+    afk_params = [AFK_CHANNEL_ID] if AFK_CHANNEL_ID else []
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT user_id, joined_ts, COALESCE(left_ts, ?)"
+            f" FROM voice_sessions"
+            f" WHERE joined_ts < ? AND COALESCE(left_ts, ?) > ?{afk_cond}",
+            [now, now, now, since] + afk_params
+        ) as cur:
+            rows = await cur.fetchall()
+
+    # Build per-user sets of active days
+    user_days: dict[int, set[str]] = {}
+    for uid, joined_ts, left_ts in rows:
+        start = max(joined_ts, since)
+        end = min(left_ts, now)
+        if end <= start:
+            continue
+        cur_ts = start
+        while cur_ts < end:
+            dt = datetime.fromtimestamp(cur_ts, tz=tz)
+            day_key = dt.strftime("%Y-%m-%d")
+            user_days.setdefault(uid, set()).add(day_key)
+            next_midnight = dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+            cur_ts = int(next_midnight.timestamp())
+
+    if not user_days:
+        await inter.followup.send("No voice activity in that window.", ephemeral=is_ephemeral)
+        return
+
+    # Filter by min_days and compute percentage
+    entries = [
+        (uid, len(active), len(active) / days * 100)
+        for uid, active in user_days.items()
+        if len(active) >= min_days
+    ]
+    entries.sort(key=lambda x: x[2], reverse=True)
+    top = entries[:10]
+
+    if not top:
+        await inter.followup.send(
+            f"No members with at least {min_days} active days in that window.", ephemeral=is_ephemeral
+        )
+        return
+
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    member_cache: dict[int, str] = {}
+
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        member_cache[uid] = escape_markdown(m.display_name)
+        return member_cache[uid]
+
+    lines = []
+    for i, (uid, active_days, pct) in enumerate(top):
+        name = await label_for(uid)
+        lines.append(f"{medals[i]} **{name}** — {pct:.0f}% ({active_days}/{days} days)")
+
+    await inter.followup.send(
+        f"📅 **Consistency leaderboard (last {days}d, min {min_days} active days):**\n" + "\n".join(lines),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
+    name="voice_binge",
+    description="Server-wide leaderboard of the biggest single-day voice sessions per user.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back to search (default 30; >30 requires admin)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_binge(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 30,
+    private: bool = False
+):
+    if days > 30 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 30 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+    now = now_ts()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """SELECT user_id, channel_id, joined_ts, left_ts
+               FROM voice_sessions
+               WHERE joined_ts < ? AND COALESCE(left_ts, ?) > ?""",
+            (now, now, since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await inter.followup.send("No voice activity in that window.", ephemeral=is_ephemeral)
+        return
+
+    # Per-user per-day totals
+    user_day_secs: dict[int, dict[str, int]] = {}
+    for uid, ch_id, joined_ts, left_ts in rows:
+        if AFK_CHANNEL_ID and ch_id == AFK_CHANNEL_ID:
+            continue
+        # reuse existing helper on a per-user basis
+        day_buckets = aggregate_seconds_by_day(
+            [(joined_ts, left_ts, ch_id)], since, now, TZ_NAME, AFK_CHANNEL_ID or None
+        )
+        uid_days = user_day_secs.setdefault(uid, {})
+        for day, secs in day_buckets.items():
+            uid_days[day] = uid_days.get(day, 0) + secs
+
+    # Best single day per user
+    best: list[tuple[int, str, int]] = []
+    for uid, day_map in user_day_secs.items():
+        if not day_map:
+            continue
+        best_day_key = max(day_map, key=day_map.get)
+        best.append((uid, best_day_key, day_map[best_day_key]))
+
+    best.sort(key=lambda x: x[2], reverse=True)
+    top = best[:10]
+
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    member_cache: dict[int, str] = {}
+
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        member_cache[uid] = escape_markdown(m.display_name)
+        return member_cache[uid]
+
+    lines = []
+    for i, (uid, day_key, secs) in enumerate(top):
+        name = await label_for(uid)
+        lines.append(f"{medals[i]} **{name}** — {fmt_duration(secs)} on `{day_key}`")
+
+    await inter.followup.send(
+        f"🔥 **Biggest single-day binge (last {days}d):**\n" + "\n".join(lines),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
     name="voice_help",
     description="Show what every voice command does.",
     guild=GUILD_OBJ
@@ -2429,15 +2955,22 @@ async def voice_help(inter: discord.Interaction):
         "`/voice_total` — Your lifetime voice total.\n"
         "`/voice_report [days]` — Your voice time in the last N days.\n"
         "`/voice_history [private]` — Your last 10 sessions with timestamps.\n"
-        "`/voice_my_chart [days]` — 📈 Your personal daily activity chart (always private)."
+        "`/voice_my_chart [days]` — 📈 Your personal daily activity chart (always private).\n"
+        "`/voice_next_milestone` — How close you are to the next time threshold + ETA (always private).\n"
+        "`/voice_best_day` — Your top 5 personal best days by voice time (always private)."
     )
     embed.add_field(name="👤 Personal", value=personal, inline=False)
 
     server_stats = (
+        "`/voice_server_overview [private]` — All-time snapshot: hours, sessions, users, avg session, top channel.\n"
         "`/voice_top [days] [private]` — Top 50 users by voice time.\n"
+        "`/voice_leaderboard_chart [days] [private]` — 📊 Top 15 users as a visual bar chart.\n"
         "`/voice_streak_board [private]` — 📊 Current daily voice streaks leaderboard.\n"
+        "`/voice_consistency [days] [min_days] [private]` — Ranked by % of days active — rewards regulars.\n"
+        "`/voice_binge [days] [private]` — Biggest single calendar day per user — who went hardest.\n"
         "`/voice_solo [days] [private]` — Top users by time spent alone in voice.\n"
         "`/voice_night_owl [days] [start_hour] [end_hour] [private]` — Late-night voice leaderboard.\n"
+        "`/voice_early_bird [days] [start_hour] [end_hour] [private]` — Early-morning voice leaderboard.\n"
         "`/voice_marathon [days] [private]` — Top 10 longest single sessions.\n"
         "`/voice_ghost [private]` — Members absent from voice the longest.\n"
         "`/voice_milestones [limit] [private]` — Recent milestone awards (1h, 5h, 10h, 25h…)."

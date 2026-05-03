@@ -22,48 +22,71 @@ Designed to run on a **Raspberry Pi** (or any Linux host) as a systemd service.
 
 ## 📋 Commands
 
-Commands default to `ephemeral: false` (public) unless marked otherwise. The `private` flag is only honoured for the designated `VOICE_TOP_PRIVATE_USER`.
+Commands default to `ephemeral: false` (public) unless marked otherwise.
+The `private` flag is only honoured for the designated `VOICE_TOP_PRIVATE_USER`.
 
-### Personal stats
+### 👤 Personal stats
 | Command | Description |
 |---|---|
-| `/voice_me` | Your personal dashboard — lifetime, last 7d, last 30d, server rank, daily streak, and who you've spent the most time with this month. Always ephemeral. |
+| `/voice_me` | Full personal dashboard — lifetime, last 7d/30d, server rank, daily streak, top voice partners. Always ephemeral. |
 | `/voice_report [days]` | Your total voice time in the last N days (default 7). Ephemeral. |
 | `/voice_total` | Your all-time lifetime voice time. Ephemeral. |
-| `/voice_history [private]` | Your last 10 sessions with timestamps, channel names, and durations. Marks any ongoing session. |
+| `/voice_history [private]` | Your last 10 sessions with timestamps, channel names, and durations. |
+| `/voice_my_chart [days]` | 📈 Your personal daily activity chart for the last N days (always ephemeral). |
+| `/voice_next_milestone` | How close you are to your next time threshold and an ETA based on your 7-day pace. Always ephemeral. |
+| `/voice_best_day` | Your top 5 personal best days by voice time ever. Always ephemeral. |
 
-### Server leaderboards
+### 🏆 Server leaderboards
 | Command | Description |
 |---|---|
+| `/voice_server_overview [private]` | All-time snapshot: total hours, sessions, unique users, avg session length, most popular channel, currently active count. |
 | `/voice_top [days] [private]` | Top 50 users by voice time in the last N days (default 7). |
+| `/voice_leaderboard_chart [days] [private]` | 📊 Top 15 users as a horizontal bar chart — coloured by rank. Default 30 days. |
+| `/voice_streak_board [private]` | 📊 Current daily voice streaks leaderboard with colour-coded bar chart. |
+| `/voice_consistency [days] [min_days] [private]` | Ranked by % of days active — rewards regulars over grinders. Default 30 days. |
+| `/voice_binge [days] [private]` | Biggest single calendar day per user — who went hardest on one day. Default 30 days. |
 | `/voice_solo [days] [private]` | Top 50 users by time spent *alone* in a channel (occupancy = 1). |
-| `/voice_bestfriends [days] [private]` | Top 10 pairs of users by shared voice time — who hangs out together most. |
-| `/voice_marathon [days] [private]` | Top 10 longest single sessions on the server, with channel and timestamp. |
-| `/voice_night_owl [days] [start_hour] [end_hour] [private]` | Leaderboard for time spent in voice during late-night hours (default 23:00–04:00, wraps midnight). |
-| `/voice_ghost [private]` | Members who have been absent from voice the longest — calls them out by name. |
+| `/voice_night_owl [days] [start_hour] [end_hour] [private]` | Leaderboard for time during late-night hours (default 23:00–04:00, wraps midnight). |
+| `/voice_early_bird [days] [start_hour] [end_hour] [private]` | Leaderboard for time during early-morning hours (default 05:00–09:00). |
+| `/voice_marathon [days] [private]` | Top 10 longest single sessions on the server. |
+| `/voice_ghost [private]` | Members who have been absent from voice the longest. |
+| `/voice_milestones [limit] [private]` | Recent milestone awards (1h, 5h, 10h, 25h, …, 10 000h). |
 
-### Head-to-head
+### ⚔️ Head-to-head
 | Command | Description |
 |---|---|
-| `/voice_rivalry @opponent [days] [private]` | Side-by-side embed comparing you vs another member — lifetime, recent, solo time, streak, rank, and time spent together. Winner of each stat is bolded. |
+| `/voice_rivalry @opponent [days] [private]` | Side-by-side embed: you vs another member — lifetime, recent, solo time, streak, rank, and time together. Winner of each stat is bolded. |
+| `/voice_bestfriends [days] [private]` | Top 10 pairs of users by shared voice time. |
 | `/voice_together @user1 @user2 [private]` | *Admin only.* Total time two specific members have spent in voice together. |
 
-### Server-wide charts
-All chart commands produce a PNG bar chart. Set `public: false` to post privately.
+### 📈 Charts & Trends
+All chart commands produce a PNG image. Use `public: false` or `private: true` to post quietly.
 
 | Command | Description |
 |---|---|
-| `/voice_heatmap [days] [public]` | Total voice hours by hour of day (00–23). Good for seeing when the server is most active. |
-| `/voice_weekdays [days] [public]` | Total voice hours by day of week (Mon–Sun). |
-| `/voice_daily [days] [public]` | Total server voice hours per day (trend). Requires admin for >7 days. |
-| `/voice_daily_unique [days] [public]` | Unique participants per day. Requires admin for >7 days. |
-| `/voice_peak [days] [public]` | Peak concurrent users per day. Requires admin for >7 days. |
+| `/voice_heatmap [days] [public] [private]` | Total voice hours by hour of day (00–23). |
+| `/voice_weekdays [days] [public] [private]` | Total voice hours by day of week (Mon–Sun). |
+| `/voice_daily [days] [public] [private]` | Total server voice hours per day (trend). |
+| `/voice_daily_unique [days] [public] [private]` | Unique participants per day. |
+| `/voice_peak [days] [public] [private]` | Peak concurrent users per day. |
+| `/voice_growth [days] [public] [private]` | 📈 Cumulative voice hours — see if the community is growing. |
+| `/voice_session_count [days] [public] [private]` | Sessions started per day — frequency, not just duration. |
+
+### 🔍 Snapshot
+| Command | Description |
+|---|---|
+| `/voice_current [private]` | Who is in voice right now, grouped by channel. |
 | `/voice_channel_stats [days] [private]` | Per-channel total hours and unique user count, ranked. |
 
-### Admin / utility
+### 🔒 Admin only
 | Command | Description |
 |---|---|
-| `/pi_storage [path]` | Shows disk usage for a given path on the host (default `/`). Restricted to `VOICE_TOP_PRIVATE_USER`. Always ephemeral. |
+| `/voice_recap [month]` | Manually post the monthly voice recap (or a specific past month in `YYYY-MM` format). |
+
+### ⚙️ Special user only
+| Command | Description |
+|---|---|
+| `/pi_storage [path]` | Disk usage for a given path on the host (default `/`). Always ephemeral. |
 
 ---
 
