@@ -1625,13 +1625,16 @@ async def voice_report(inter: discord.Interaction, days: app_commands.Range[int,
 )
 @app_commands.describe(
     days="How many days back to include (default 30)",
-    public="Set to false to post privately (default: true)"
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
 )
 async def voice_weekdays(inter: discord.Interaction,
                          days: app_commands.Range[int, 1, 3650] = 30,
-                         public: bool = True):
+                         public: bool = True,
+                         private: bool = False):
     since = now_ts() - days * 86400
-    await inter.response.defer(thinking=True, ephemeral=not public)
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -1665,7 +1668,7 @@ async def voice_weekdays(inter: discord.Interaction,
     await inter.followup.send(
         content=f"Anonymized server-wide weekday breakdown for last **{days}d**.",
         file=discord.File(buf, filename="voice_weekdays.png"),
-        ephemeral=not public
+        ephemeral=is_ephemeral
     )
 
 
@@ -1742,17 +1745,20 @@ async def voice_solo(inter: discord.Interaction,
 )
 @app_commands.describe(
     days="How many days back (default 7; >7 requires admin)",
-    public="Set to false to post privately (default: true)"
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
 )
 async def voice_peak(inter: discord.Interaction,
                      days: app_commands.Range[int, 1, 3650] = 7,
-                     public: bool = True):
+                     public: bool = True,
+                     private: bool = False):
     if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
         await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
         return
 
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
     since = now_ts() - days * 86400
-    await inter.response.defer(thinking=True, ephemeral=not public)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     rows = await fetch_sessions_window(since)
     overall_peak, per_day_peak = peak_concurrency(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
@@ -1783,7 +1789,7 @@ async def voice_peak(inter: discord.Interaction,
     await inter.followup.send(
         content=f"**Overall peak** in last {days}d: **{overall_peak}** users.",
         file=discord.File(buf, "voice_peak.png"),
-        ephemeral=not public
+        ephemeral=is_ephemeral
     )
 
 
@@ -1794,17 +1800,20 @@ async def voice_peak(inter: discord.Interaction,
 )
 @app_commands.describe(
     days="How many days back (default 7; >7 requires admin)",
-    public="Set to false to post privately (default: true)"
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
 )
 async def voice_daily_unique(inter: discord.Interaction,
                              days: app_commands.Range[int, 1, 3650] = 7,
-                             public: bool = True):
+                             public: bool = True,
+                             private: bool = False):
     if days > 7 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
         await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
         return
 
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
     since = now_ts() - days * 86400
-    await inter.response.defer(thinking=True, ephemeral=not public)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     rows = await fetch_sessions_window(since)
     day_users = aggregate_unique_users_by_day(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
@@ -1835,7 +1844,7 @@ async def voice_daily_unique(inter: discord.Interaction,
     await inter.followup.send(
         file=discord.File(buf, "voice_daily_unique.png"),
         content=f"Unique participants per day (last **{days}d**).",
-        ephemeral=not public
+        ephemeral=is_ephemeral
     )
 
 
@@ -1846,14 +1855,16 @@ async def voice_daily_unique(inter: discord.Interaction,
 )
 @app_commands.describe(
     days="How many days back to include (default 7)",
-    public="Set to false to post privately (default: true)"
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
 )
 async def voice_heatmap(inter: discord.Interaction,
                         days: app_commands.Range[int, 1, 3650] = 7,
-                        public: bool = True):
+                        public: bool = True,
+                        private: bool = False):
     since = now_ts() - days * 86400
-    # FIX: defer first so DB query + matplotlib can't time out the interaction
-    await inter.response.defer(thinking=True, ephemeral=not public)
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -1884,11 +1895,10 @@ async def voice_heatmap(inter: discord.Interaction,
     plt.close()
     buf.seek(0)
 
-    # FIX: use followup.send (not response.send_message) after defer
     await inter.followup.send(
         content=f"Anonymized server-wide heatmap for last **{days}d**.",
         file=discord.File(buf, filename="voice_heatmap.png"),
-        ephemeral=not public
+        ephemeral=is_ephemeral
     )
 
 
@@ -1899,19 +1909,22 @@ async def voice_heatmap(inter: discord.Interaction,
 )
 @app_commands.describe(
     days="How many days back (default 7; >7 requires admin)",
-    public="Set false to post privately (default: true)"
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
 )
 async def voice_daily(inter: discord.Interaction,
                       days: app_commands.Range[int, 1, 3650] = 7,
-                      public: bool = True):
+                      public: bool = True,
+                      private: bool = False):
     if days > 7:
         perms = inter.user.guild_permissions
         if not (perms.administrator or perms.manage_guild):
             await inter.response.send_message("⛔ Only admins can request more than 7 days.", ephemeral=True)
             return
 
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
     since = now_ts() - days * 86400
-    await inter.response.defer(thinking=True, ephemeral=not public)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
 
     async with aiosqlite.connect(DB_PATH) as cx:
         async with cx.execute(
@@ -1954,7 +1967,7 @@ async def voice_daily(inter: discord.Interaction,
     await inter.followup.send(
         content=f"Anonymized server-wide daily totals for last **{days}d**.",
         file=discord.File(buf, filename="voice_daily.png"),
-        ephemeral=not public
+        ephemeral=is_ephemeral
     )
 
 
@@ -1974,14 +1987,18 @@ async def voice_total(inter: discord.Interaction):
 
 
 @tree.command(name="voice_current", description="List users currently in voice channels.", guild=GUILD_OBJ)
-async def voice_current(inter: discord.Interaction):
+@app_commands.describe(
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_current(inter: discord.Interaction, private: bool = False):
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
     lines = []
     for vc in inter.guild.voice_channels:
         if vc.members:
             names = ", ".join(m.display_name for m in vc.members)
             lines.append(f"🔊 **{vc.name}**: {names}")
     msg = "\n".join(lines) if lines else "No one is in voice right now."
-    await inter.response.send_message(msg)
+    await inter.response.send_message(msg, ephemeral=is_ephemeral)
 
 
 @tree.command(
@@ -2045,6 +2062,421 @@ async def voice_top(inter: discord.Interaction,
 
     text = f"**Top 50 voice users (last {days}d):**\n" + "\n".join(lines)
     await inter.followup.send(text, ephemeral=is_ephemeral, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(
+    name="voice_streak_board",
+    description="Leaderboard of current daily voice streaks with a bar chart.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_streak_board(inter: discord.Interaction, private: bool = False):
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute("SELECT DISTINCT user_id FROM voice_sessions") as cur:
+            user_rows = await cur.fetchall()
+
+    streak_data = []
+    for (uid,) in user_rows:
+        if inter.guild.get_member(uid) is None:
+            continue
+        streak = await compute_streak(uid)
+        if streak > 0:
+            streak_data.append((uid, streak))
+
+    if not streak_data:
+        await inter.followup.send("No active streaks right now.", ephemeral=is_ephemeral)
+        return
+
+    streak_data.sort(key=lambda x: x[1], reverse=True)
+    top = streak_data[:15]
+
+    member_cache: dict[int, str] = {}
+
+    async def label_for(uid: int) -> str:
+        if uid in member_cache:
+            return member_cache[uid]
+        m = inter.guild.get_member(uid)
+        if m is None:
+            try:
+                m = await inter.guild.fetch_member(uid)
+            except (NotFound, Forbidden, Exception):
+                member_cache[uid] = f"User {uid}"
+                return member_cache[uid]
+        member_cache[uid] = escape_markdown(m.display_name)
+        return member_cache[uid]
+
+    names = []
+    streaks = []
+    for uid, streak in top:
+        names.append(await label_for(uid))
+        streaks.append(streak)
+
+    max_streak = max(streaks)
+    colors = [plt.cm.RdYlGn(s / max_streak) for s in streaks]
+
+    plt.figure(figsize=PLOT_SIZE)
+    bars = plt.bar(range(len(names)), streaks, color=colors)
+    plt.xticks(range(len(names)), names, rotation=30, ha="right")
+    plt.ylabel("Streak (days)")
+    plt.title("Current daily voice streaks 🔥")
+    for bar, s in zip(bars, streaks):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                 str(s), ha="center", va="bottom", fontsize=9)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 16)]
+    lines = [
+        f"{medals[i]} **{names[i]}** — {streaks[i]} day{'s' if streaks[i] != 1 else ''} 🔥"
+        for i in range(len(names))
+    ]
+    await inter.followup.send(
+        content="🔥 **Voice streak leaderboard:**\n" + "\n".join(lines),
+        file=discord.File(buf, "voice_streaks.png"),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
+    name="voice_my_chart",
+    description="Your personal daily voice activity chart for the last N days (always private).",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(days="How many days back to chart (default 14)")
+async def voice_my_chart(inter: discord.Interaction, days: app_commands.Range[int, 1, 365] = 14):
+    await inter.response.defer(thinking=True, ephemeral=True)
+
+    since = now_ts() - days * 86400
+    uid = inter.user.id
+    extra, params = afk_filter_clause()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT joined_ts, left_ts, channel_id FROM voice_sessions "
+            f"WHERE user_id=? AND joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?{extra}",
+            [uid, now_ts(), since] + params
+        ) as cur:
+            rows = await cur.fetchall()
+
+    buckets = aggregate_seconds_by_day(rows, since, now_ts(), TZ_NAME, AFK_CHANNEL_ID or None)
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    days_list = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    values_hours = [buckets.get(d, 0) / 3600.0 for d in days_list]
+
+    plt.figure(figsize=PLOT_SIZE)
+    x = list(range(len(days_list)))
+    plt.fill_between(x, values_hours, alpha=0.35)
+    plt.plot(x, values_hours, marker="o", markersize=4, linewidth=1.5)
+    step = max(1, len(x) // 14)
+    plt.xticks(x[::step], days_list[::step], rotation=45, ha="right")
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"{escape_markdown(inter.user.display_name)} — daily voice (last {days}d){subtitle}")
+    plt.ylabel("Hours")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    total_h = sum(values_hours)
+    avg_h = total_h / days if days else 0
+    await inter.followup.send(
+        content=(
+            f"📈 **Your voice activity (last {days}d)** — "
+            f"total: **{fmt_duration(int(total_h * 3600))}**, avg: **{avg_h:.1f}h/day**"
+        ),
+        file=discord.File(buf, "voice_my_chart.png"),
+        ephemeral=True
+    )
+
+
+@tree.command(
+    name="voice_growth",
+    description="Cumulative server voice hours over the last N days — see if the community is growing.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back (default 30; >30 requires admin)",
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_growth(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 2, 3650] = 30,
+    public: bool = True,
+    private: bool = False
+):
+    if days > 30 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 30 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            "SELECT joined_ts, left_ts, channel_id FROM voice_sessions "
+            "WHERE joined_ts < ? AND COALESCE(left_ts, strftime('%s','now')) > ?",
+            (now_ts(), since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    daily = aggregate_seconds_by_day(rows, since, now_ts(), TZ_NAME, AFK_CHANNEL_ID or None)
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    days_list = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+
+    cumulative = []
+    running = 0.0
+    for d in days_list:
+        running += daily.get(d, 0) / 3600.0
+        cumulative.append(running)
+
+    step = max(1, len(days_list) // 10)
+    plt.figure(figsize=PLOT_SIZE)
+    x = list(range(len(days_list)))
+    plt.fill_between(x, cumulative, alpha=0.25)
+    plt.plot(x, cumulative, linewidth=2)
+    plt.xticks(x[::step], days_list[::step], rotation=45, ha="right")
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"Cumulative voice hours (last {days}d){subtitle}")
+    plt.ylabel("Cumulative hours")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    total_h = cumulative[-1] if cumulative else 0.0
+    await inter.followup.send(
+        content=(
+            f"📈 **Cumulative voice hours (last {days}d):** **{total_h:.1f}h** total"
+            f"{' (AFK excluded)' if AFK_CHANNEL_ID else ''}"
+        ),
+        file=discord.File(buf, "voice_growth.png"),
+        ephemeral=is_ephemeral
+    )
+
+
+@tree.command(
+    name="voice_milestones",
+    description="Recent voice time milestone awards — see who crossed a big threshold.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    limit="How many recent milestones to show (default 10)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_milestones(
+    inter: discord.Interaction,
+    limit: app_commands.Range[int, 1, 50] = 10,
+    private: bool = False
+):
+    is_ephemeral = (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            "SELECT user_id, hours, awarded_ts FROM milestones ORDER BY awarded_ts DESC LIMIT ?",
+            (limit,)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await inter.followup.send("No milestones have been awarded yet.", ephemeral=is_ephemeral)
+        return
+
+    lines = []
+    for uid, hours, awarded_ts in rows:
+        m = inter.guild.get_member(uid)
+        name = escape_markdown(m.display_name if m else f"User {uid}")
+        date_str = ts_to_local(awarded_ts)
+        lines.append(f"🏆 **{name}** hit **{hours}h** — `{date_str}`")
+
+    await inter.followup.send(
+        "🏆 **Recent voice milestones:**\n" + "\n".join(lines),
+        ephemeral=is_ephemeral,
+        allowed_mentions=discord.AllowedMentions.none()
+    )
+
+
+@tree.command(
+    name="voice_session_count",
+    description="Voice sessions started per day — shows how often members join, not just how long.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    days="How many days back (default 14; >14 requires admin)",
+    public="Post publicly (default: true)",
+    private="Post privately — only works if you're the designated private user (default: false)"
+)
+async def voice_session_count(
+    inter: discord.Interaction,
+    days: app_commands.Range[int, 1, 3650] = 14,
+    public: bool = True,
+    private: bool = False
+):
+    if days > 14 and not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+        await inter.response.send_message("⛔ Only admins can request more than 14 days.", ephemeral=True)
+        return
+
+    is_ephemeral = (not public) or (private and inter.user.id == VOICE_TOP_PRIVATE_USER)
+    await inter.response.defer(thinking=True, ephemeral=is_ephemeral)
+
+    since = now_ts() - days * 86400
+    afk_cond = " AND channel_id != ?" if AFK_CHANNEL_ID else ""
+    afk_params = [AFK_CHANNEL_ID] if AFK_CHANNEL_ID else []
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            f"SELECT joined_ts FROM voice_sessions WHERE joined_ts >= ?{afk_cond}",
+            [since] + afk_params
+        ) as cur:
+            rows = await cur.fetchall()
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    counts: dict[str, int] = {}
+    for (joined_ts,) in rows:
+        day_key = datetime.fromtimestamp(joined_ts, tz=tz).strftime("%Y-%m-%d")
+        counts[day_key] = counts.get(day_key, 0) + 1
+
+    base = datetime.fromtimestamp(since, tz=tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    days_list = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    values = [counts.get(d, 0) for d in days_list]
+
+    plt.figure(figsize=PLOT_SIZE)
+    x = list(range(len(days_list)))
+    plt.bar(x, values)
+    plt.xticks(x, days_list, rotation=45, ha="right")
+    subtitle = " (AFK excluded)" if AFK_CHANNEL_ID else ""
+    plt.title(f"Voice sessions started per day (last {days}d){subtitle}")
+    plt.ylabel("Sessions")
+    plt.xlabel("Day")
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    plt.close()
+    buf.seek(0)
+
+    total_s = sum(values)
+    avg_s = total_s / days if days else 0
+    await inter.followup.send(
+        content=(
+            f"📊 **Sessions per day (last {days}d):** "
+            f"**{total_s}** total, avg **{avg_s:.1f}/day**"
+            f"{' (AFK excluded)' if AFK_CHANNEL_ID else ''}"
+        ),
+        file=discord.File(buf, "voice_session_count.png"),
+        ephemeral=is_ephemeral
+    )
+
+
+@tree.command(
+    name="voice_help",
+    description="Show what every voice command does.",
+    guild=GUILD_OBJ
+)
+async def voice_help(inter: discord.Interaction):
+    await inter.response.defer(thinking=True, ephemeral=True)
+
+    embed = discord.Embed(
+        title="🎙️  Voice Bot — Command Reference",
+        description=(
+            "All commands are restricted to designated channels.\n"
+            "The `private` flag (where shown) lets the special user see output only to themselves.\n"
+            "Commands marked 📊/📈 include a chart image."
+        ),
+        color=discord.Color.blurple()
+    )
+
+    personal = (
+        "`/voice_me` — Full personal dashboard: lifetime, 7d/30d, rank, streak, top partners.\n"
+        "`/voice_total` — Your lifetime voice total.\n"
+        "`/voice_report [days]` — Your voice time in the last N days.\n"
+        "`/voice_history [private]` — Your last 10 sessions with timestamps.\n"
+        "`/voice_my_chart [days]` — 📈 Your personal daily activity chart (always private)."
+    )
+    embed.add_field(name="👤 Personal", value=personal, inline=False)
+
+    server_stats = (
+        "`/voice_top [days] [private]` — Top 50 users by voice time.\n"
+        "`/voice_streak_board [private]` — 📊 Current daily voice streaks leaderboard.\n"
+        "`/voice_solo [days] [private]` — Top users by time spent alone in voice.\n"
+        "`/voice_night_owl [days] [start_hour] [end_hour] [private]` — Late-night voice leaderboard.\n"
+        "`/voice_marathon [days] [private]` — Top 10 longest single sessions.\n"
+        "`/voice_ghost [private]` — Members absent from voice the longest.\n"
+        "`/voice_milestones [limit] [private]` — Recent milestone awards (1h, 5h, 10h, 25h…)."
+    )
+    embed.add_field(name="🏆 Server Stats", value=server_stats, inline=False)
+
+    charts = (
+        "`/voice_heatmap [days] [public] [private]` — 📊 Activity by hour of day.\n"
+        "`/voice_weekdays [days] [public] [private]` — 📊 Activity by weekday (Mon–Sun).\n"
+        "`/voice_daily [days] [public] [private]` — 📊 Total server hours per day.\n"
+        "`/voice_daily_unique [days] [public] [private]` — 📊 Unique participants per day.\n"
+        "`/voice_peak [days] [public] [private]` — 📊 Peak concurrent users per day.\n"
+        "`/voice_growth [days] [public] [private]` — 📈 Cumulative voice hours over time.\n"
+        "`/voice_session_count [days] [public] [private]` — 📊 Sessions started per day."
+    )
+    embed.add_field(name="📈 Charts & Trends", value=charts, inline=False)
+
+    social = (
+        "`/voice_bestfriends [days] [private]` — Top pairs by shared voice time.\n"
+        "`/voice_rivalry <opponent> [days] [private]` — Head-to-head stats vs another member.\n"
+        "`/voice_channel_stats [days] [private]` — Which channels get the most traffic.\n"
+        "`/voice_current [private]` — Who's in voice right now."
+    )
+    embed.add_field(name="🤝 Social", value=social, inline=False)
+
+    admin_cmds = (
+        "`/voice_together <user1> <user2> [private]` — [Admin] Time two members spent in voice together.\n"
+        "`/voice_recap [month]` — [Admin] Manually post the monthly voice recap."
+    )
+    embed.add_field(name="🔒 Admin Only", value=admin_cmds, inline=False)
+
+    embed.add_field(
+        name="⚙️ Special User",
+        value="`/pi_storage [path]` — Disk usage on the Pi.",
+        inline=False
+    )
+
+    embed.set_footer(text="Chart commands default to public. Use private=True (special user) or public=False to post only to yourself.")
+    await inter.followup.send(embed=embed, ephemeral=True)
 
 
 # -------- Run --------
