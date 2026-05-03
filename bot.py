@@ -705,6 +705,94 @@ async def milestone_check():
                         )
 
 
+async def _build_and_send_recap(guild: discord.Guild, channel, month_override: str | None = None):
+    """
+    Core logic for the monthly recap. Extracted so both the scheduled task
+    and the manual /voice_recap command can call it.
+    month_override: optional 'YYYY-MM' string to recap a specific past month.
+    """
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    now_local = datetime.now(tz)
+
+    if month_override:
+        # Parse 'YYYY-MM' and build the window for that specific month
+        year, month = map(int, month_override.split("-"))
+        first_last_month = datetime(year, month, 1, tzinfo=tz)
+        if month == 12:
+            first_this_month = datetime(year + 1, 1, 1, tzinfo=tz)
+        else:
+            first_this_month = datetime(year, month + 1, 1, tzinfo=tz)
+    else:
+        first_this_month = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if first_this_month.month == 1:
+            first_last_month = first_this_month.replace(year=first_this_month.year - 1, month=12)
+        else:
+            first_last_month = first_this_month.replace(month=first_this_month.month - 1)
+
+    since = int(first_last_month.timestamp())
+    until = int(first_this_month.timestamp())
+    month_label = first_last_month.strftime("%B %Y")
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(
+            """
+            SELECT user_id, channel_id, joined_ts, left_ts
+            FROM voice_sessions
+            WHERE joined_ts < ? AND COALESCE(left_ts, ?) > ?
+            """,
+            (until, until, since)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    user_secs: dict[int, int] = defaultdict(int)
+    total_secs = 0
+    for uid, ch_id, joined_ts, left_ts in rows:
+        if AFK_CHANNEL_ID and ch_id == AFK_CHANNEL_ID:
+            continue
+        start = max(joined_ts, since)
+        end = min(left_ts or until, until)
+        if end > start:
+            dur = end - start
+            user_secs[uid] += dur
+            total_secs += dur
+
+    day_rows = [(joined_ts, left_ts, ch_id) for _, ch_id, joined_ts, left_ts in rows]
+    day_buckets = aggregate_seconds_by_day(day_rows, since, until, TZ_NAME, AFK_CHANNEL_ID or None)
+    best_day = max(day_buckets, key=day_buckets.get) if day_buckets else None
+    best_day_str = f"{best_day} ({fmt_duration(day_buckets[best_day])})" if best_day else "N/A"
+
+    overall_peak, _ = peak_concurrency(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
+    unique_count = len(user_secs)
+
+    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+    top5 = sorted(user_secs.items(), key=lambda x: x[1], reverse=True)[:5]
+    leaderboard_lines = []
+    for i, (uid, secs) in enumerate(top5):
+        m = guild.get_member(uid)
+        name = escape_markdown(m.display_name if m else f"User {uid}")
+        leaderboard_lines.append(f"{medals[i]} **{name}** — {fmt_duration(secs)}")
+    leaderboard_str = "\n".join(leaderboard_lines) if leaderboard_lines else "No activity"
+
+    embed = discord.Embed(
+        title=f"📅  {month_label} — Voice Recap",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="🕐 Total Voice Time", value=fmt_duration(total_secs), inline=True)
+    embed.add_field(name="👥 Participants",      value=str(unique_count),        inline=True)
+    embed.add_field(name="📈 Peak Concurrent",   value=str(overall_peak),        inline=True)
+    embed.add_field(name="🔥 Most Active Day",   value=best_day_str,             inline=False)
+    embed.add_field(name="🏆 Top Members",       value=leaderboard_str,          inline=False)
+    embed.set_footer(text=f"{guild.name} • Generated on {datetime.now(tz).strftime('%d %b %Y')}")
+
+    await channel.send(embed=embed)
+    print(f"✅ Monthly recap posted for {month_label}")
+
+
 @tasks.loop(hours=24)
 async def monthly_recap():
     """Posts a server-wide voice recap on the 1st of every month covering the previous month."""
@@ -722,9 +810,11 @@ async def monthly_recap():
 
     guild = client.get_guild(int(GUILD_ID))
     if not guild:
+        print("⚠️  monthly_recap: guild not found")
         return
     channel = guild.get_channel(BOT_CHANNEL)
     if not channel:
+        print(f"⚠️  monthly_recap: BOT_CHANNEL {BOT_CHANNEL} not found")
         return
 
     # Window: midnight on the 1st of last month → midnight on the 1st of this month
@@ -772,28 +862,14 @@ async def monthly_recap():
     overall_peak, _ = peak_concurrency(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
     unique_count = len(user_secs)
 
-    # Top 5 for the leaderboard field
-    medals = ["🥇", "🥈", "🥉", "4.", "5."]
-    top5 = sorted(user_secs.items(), key=lambda x: x[1], reverse=True)[:5]
-    leaderboard_lines = []
-    for i, (uid, secs) in enumerate(top5):
-        m = guild.get_member(uid)
-        name = escape_markdown(m.display_name if m else f"User {uid}")
-        leaderboard_lines.append(f"{medals[i]} **{name}** — {fmt_duration(secs)}")
-    leaderboard_str = "\n".join(leaderboard_lines) if leaderboard_lines else "No activity"
+    await _build_and_send_recap(guild, channel)
 
-    embed = discord.Embed(
-        title=f"📅  {month_label} — Voice Recap",
-        color=discord.Color.blurple()
-    )
-    embed.add_field(name="🕐 Total Voice Time", value=fmt_duration(total_secs), inline=True)
-    embed.add_field(name="👥 Participants",      value=str(unique_count),        inline=True)
-    embed.add_field(name="📈 Peak Concurrent",   value=str(overall_peak),        inline=True)
-    embed.add_field(name="🔥 Most Active Day",   value=best_day_str,             inline=False)
-    embed.add_field(name="🏆 Top Members",       value=leaderboard_str,          inline=False)
-    embed.set_footer(text=f"{guild.name} • Generated on {datetime.now(tz).strftime('%d %b %Y')}")
 
-    await channel.send(embed=embed)
+@monthly_recap.error
+async def monthly_recap_error(error: Exception):
+    print(f"❌ monthly_recap task crashed: {error!r} — restarting task")
+    if not monthly_recap.is_running():
+        monthly_recap.start()
 
 
 # -------- Startup --------
@@ -872,6 +948,40 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 
 # -------- Slash commands --------
+
+@tree.command(
+    name="voice_recap",
+    description="[Admin only] Manually post the monthly voice recap. Use if the scheduled post was missed.",
+    guild=GUILD_OBJ
+)
+@app_commands.describe(
+    month="Month to recap in YYYY-MM format (default: last month, e.g. 2026-04)"
+)
+async def voice_recap(inter: discord.Interaction, month: str | None = None):
+    if not await admin_guard(inter):
+        return
+
+    # Validate optional month override
+    if month:
+        try:
+            year, mon = map(int, month.split("-"))
+            if not (1 <= mon <= 12):
+                raise ValueError
+        except (ValueError, AttributeError):
+            await inter.response.send_message(
+                "❌ Invalid format. Use `YYYY-MM`, e.g. `2026-04`.", ephemeral=True
+            )
+            return
+
+    await inter.response.defer(thinking=True)
+
+    channel = inter.guild.get_channel(BOT_CHANNEL) or inter.channel
+    try:
+        await _build_and_send_recap(inter.guild, channel, month_override=month)
+        await inter.followup.send("✅ Recap posted.", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"❌ Failed to post recap: `{e}`", ephemeral=True)
+
 
 @tree.command(
     name="pi_storage",
