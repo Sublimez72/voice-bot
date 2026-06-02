@@ -25,6 +25,7 @@ VOICE_TOP_PRIVATE_USER = int(os.getenv("VOICE_TOP_PRIVATE_USER", "0"))
 VOICE_COMMAND_CHANNEL = int(os.getenv("VOICE_COMMAND_CHANNEL", "0"))
 BOT_CHANNEL = int(os.getenv("VOICE_BOT_CHANNEL", "0"))
 ALLOWED_CHANNELS = {cid for cid in (VOICE_COMMAND_CHANNEL, BOT_CHANNEL) if cid}
+WEEKLY_TOP_ROLE_ID = int(os.getenv("WEEKLY_TOP_ROLE_ID", "247066749873160193"))
 
 # Milestone thresholds in hours.
 # Early game: 1, 5, 10, 25, 50, 100
@@ -793,9 +794,14 @@ async def _build_and_send_recap(guild: discord.Guild, channel, month_override: s
     print(f"✅ Monthly recap posted for {month_label}")
 
 
-@tasks.loop(hours=24)
+_last_recapped_month: str | None = None  # "YYYY-MM" of the last auto-posted recap
+
+
+@tasks.loop(hours=1)
 async def monthly_recap():
-    """Posts a server-wide voice recap on the 1st of every month covering the previous month."""
+    """Posts a server-wide voice recap on the 1st of every month covering the previous month.
+    Runs hourly so a bot restart on the 1st never causes a missed post."""
+    global _last_recapped_month
     if not GUILD_ID or not BOT_CHANNEL:
         return
     try:
@@ -805,8 +811,12 @@ async def monthly_recap():
         tz = timezone.utc
 
     now_local = datetime.now(tz)
-    if now_local.day != 1:  # only fire on the 1st of the month
+    if now_local.day != 1:
         return
+
+    current_month_key = now_local.strftime("%Y-%m")
+    if _last_recapped_month == current_month_key:
+        return  # already posted this month
 
     guild = client.get_guild(int(GUILD_ID))
     if not guild:
@@ -817,52 +827,8 @@ async def monthly_recap():
         print(f"⚠️  monthly_recap: BOT_CHANNEL {BOT_CHANNEL} not found")
         return
 
-    # Window: midnight on the 1st of last month → midnight on the 1st of this month
-    first_this_month = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if first_this_month.month == 1:
-        first_last_month = first_this_month.replace(year=first_this_month.year - 1, month=12)
-    else:
-        first_last_month = first_this_month.replace(month=first_this_month.month - 1)
-
-    since = int(first_last_month.timestamp())
-    until = int(first_this_month.timestamp())
-    month_label = first_last_month.strftime("%B %Y")  # e.g. "April 2026"
-
-    # Fetch sessions overlapping last month's window
-    async with aiosqlite.connect(DB_PATH) as cx:
-        async with cx.execute(
-            """
-            SELECT user_id, channel_id, joined_ts, left_ts
-            FROM voice_sessions
-            WHERE joined_ts < ? AND COALESCE(left_ts, ?) > ?
-            """,
-            (until, until, since)
-        ) as cur:
-            rows = await cur.fetchall()
-
-    user_secs: dict[int, int] = defaultdict(int)
-    total_secs = 0
-
-    for uid, ch_id, joined_ts, left_ts in rows:
-        if AFK_CHANNEL_ID and ch_id == AFK_CHANNEL_ID:
-            continue
-        start = max(joined_ts, since)
-        end = min(left_ts or until, until)
-        if end > start:
-            dur = end - start
-            user_secs[uid] += dur
-            total_secs += dur
-
-    # Most active day
-    day_rows = [(joined_ts, left_ts, ch_id) for _, ch_id, joined_ts, left_ts in rows]
-    day_buckets = aggregate_seconds_by_day(day_rows, since, until, TZ_NAME, AFK_CHANNEL_ID or None)
-    best_day = max(day_buckets, key=day_buckets.get) if day_buckets else None
-    best_day_str = f"{best_day} ({fmt_duration(day_buckets[best_day])})" if best_day else "N/A"
-
-    overall_peak, _ = peak_concurrency(rows, since, TZ_NAME, AFK_CHANNEL_ID or None)
-    unique_count = len(user_secs)
-
     await _build_and_send_recap(guild, channel)
+    _last_recapped_month = current_month_key
 
 
 @monthly_recap.error
@@ -870,6 +836,105 @@ async def monthly_recap_error(error: Exception):
     print(f"❌ monthly_recap task crashed: {error!r} — restarting task")
     if not monthly_recap.is_running():
         monthly_recap.start()
+
+
+async def _assign_weekly_top_role(guild: discord.Guild) -> str:
+    """
+    Query top 5 voice users over the last 7 days, give them WEEKLY_TOP_ROLE_ID,
+    and remove it from everyone else who currently has it.
+    Returns a human-readable status string.
+    """
+    role = guild.get_role(WEEKLY_TOP_ROLE_ID)
+    if role is None:
+        return f"⚠️ Role {WEEKLY_TOP_ROLE_ID} not found in guild."
+
+    since = now_ts() - 7 * 86400
+    extra, params = afk_filter_clause()
+
+    async with aiosqlite.connect(DB_PATH) as cx:
+        async with cx.execute(f"""
+            SELECT user_id,
+                   SUM(COALESCE(left_ts, strftime('%s','now')) - joined_ts) AS total
+            FROM voice_sessions
+            WHERE joined_ts < strftime('%s','now')
+              AND COALESCE(left_ts, strftime('%s','now')) > ?
+              {extra}
+            GROUP BY user_id
+            ORDER BY total DESC
+            LIMIT 5
+        """, [since] + params) as cur:
+            rows = await cur.fetchall()
+
+    top_ids = {uid for uid, _ in rows}
+
+    added, removed, errors = [], [], []
+
+    # Remove from anyone who has it but isn't in top 5
+    for member in guild.members:
+        if role in member.roles and member.id not in top_ids:
+            try:
+                await member.remove_roles(role, reason="Weekly top-5 voice rotation")
+                removed.append(member.display_name)
+            except Exception as e:
+                errors.append(f"remove {member.id}: {e}")
+
+    # Add to top 5
+    for uid, _ in rows:
+        member = guild.get_member(uid)
+        if member is None:
+            try:
+                member = await guild.fetch_member(uid)
+            except Exception:
+                errors.append(f"fetch {uid}: not found")
+                continue
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="Weekly top-5 voice rotation")
+                added.append(member.display_name)
+            except Exception as e:
+                errors.append(f"add {uid}: {e}")
+
+    parts = []
+    if added:
+        parts.append(f"✅ Added: {', '.join(added)}")
+    if removed:
+        parts.append(f"🗑️ Removed: {', '.join(removed)}")
+    if not added and not removed:
+        parts.append("No changes needed.")
+    if errors:
+        parts.append(f"⚠️ Errors: {'; '.join(errors)}")
+    return "\n".join(parts)
+
+
+@tasks.loop(hours=24)
+async def weekly_top_role():
+    """Every Monday, assign WEEKLY_TOP_ROLE_ID to the top 5 voice users of the past 7 days."""
+    if not GUILD_ID:
+        return
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(TZ_NAME)
+    except Exception:
+        tz = timezone.utc
+
+    now_local = datetime.now(tz)
+    if now_local.weekday() != 0:  # 0 = Monday
+        return
+
+    guild = client.get_guild(int(GUILD_ID))
+    if not guild:
+        print("⚠️  weekly_top_role: guild not found")
+        return
+
+    result = await _assign_weekly_top_role(guild)
+    print(f"📅 weekly_top_role: {result}")
+
+
+@weekly_top_role.error
+async def weekly_top_role_error(error: Exception):
+    print(f"❌ weekly_top_role task crashed: {error!r} — restarting task")
+    if not weekly_top_role.is_running():
+        weekly_top_role.start()
 
 
 # -------- Startup --------
@@ -912,6 +977,8 @@ async def on_ready():
         milestone_check.start()
     if not monthly_recap.is_running():
         monthly_recap.start()
+    if not weekly_top_role.is_running():
+        weekly_top_role.start()
 
     print(f"Bot online as {client.user}")
 
@@ -958,7 +1025,8 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     month="Month to recap in YYYY-MM format (default: last month, e.g. 2026-04)"
 )
 async def voice_recap(inter: discord.Interaction, month: str | None = None):
-    if not await admin_guard(inter):
+    is_hidden = inter.user.id == VOICE_TOP_PRIVATE_USER
+    if not is_hidden and not await admin_guard(inter):
         return
 
     # Validate optional month override
@@ -973,7 +1041,7 @@ async def voice_recap(inter: discord.Interaction, month: str | None = None):
             )
             return
 
-    await inter.response.defer(thinking=True)
+    await inter.response.defer(thinking=True, ephemeral=is_hidden)
 
     channel = inter.guild.get_channel(BOT_CHANNEL) or inter.channel
     try:
@@ -3004,12 +3072,30 @@ async def voice_help(inter: discord.Interaction):
 
     embed.add_field(
         name="⚙️ Special User",
-        value="`/pi_storage [path]` — Disk usage on the Pi.",
+        value=(
+            "`/pi_storage [path]` — Disk usage on the Pi.\n"
+            "`/voice_weekly_role` — Manually run the weekly top-5 voice role assignment.\n"
+            "`/voice_recap [month]` — Also available to special user; posts the monthly recap."
+        ),
         inline=False
     )
 
     embed.set_footer(text="Chart commands default to public. Use private=True (special user) or public=False to post only to yourself.")
     await inter.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(
+    name="voice_weekly_role",
+    description="Manually assign the weekly top-5 voice role. Restricted to special user.",
+    guild=GUILD_OBJ
+)
+async def voice_weekly_role(inter: discord.Interaction):
+    if inter.user.id != VOICE_TOP_PRIVATE_USER:
+        await inter.response.send_message("⛔ This command is restricted.", ephemeral=True)
+        return
+    await inter.response.defer(thinking=True, ephemeral=True)
+    result = await _assign_weekly_top_role(inter.guild)
+    await inter.followup.send(result, ephemeral=True)
 
 
 # -------- Run --------
